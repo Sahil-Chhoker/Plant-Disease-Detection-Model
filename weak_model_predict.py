@@ -5,7 +5,7 @@ import time
 import math
 
 # --- Configuration ---
-MODEL_PATH = 'model.tflite'  
+MODEL_PATH = 'weak_model.tflite'  
 IMAGE_PATH = 'input/img5.jpeg'
 LABEL_PATH = 'dict.txt'      
 

@@ -3,9 +3,12 @@ import shutil
 import re
 from inference_sdk import InferenceHTTPClient
 from PIL import Image, ImageDraw, ImageFont
+import dotenv
+
+dotenv.load_dotenv()
 
 API_URL = "https://serverless.roboflow.com"
-API_KEY = "BZG3UEDpehSN4kHPqos3"
+API_KEY = os.getenv("ROBOFLOW_API_KEY")
 MODEL_ID = "plant-disease-detection-v2-2nclk/1"
 
 INPUT_FOLDER = "input"

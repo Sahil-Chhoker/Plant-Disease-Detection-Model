@@ -1,8 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Plant Species and Disease Identification using Transfer Learning (Multi-Output CNN)
-"""
-
 import os
 import glob
 import numpy as np
@@ -10,528 +5,682 @@ import cv2
 import pickle
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelBinarizer
+import tensorflow as tf
 from tensorflow import keras
 from keras import layers, models, applications, optimizers, losses, metrics
 from keras._tf_keras.keras.preprocessing.image import ImageDataGenerator
 from keras._tf_keras.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from sklearn.metrics import classification_report
-import tensorflow as tf
+import time
 
-# --- Configuration ---
-DATASET_PATH = 'dataset2/' # IMPORTANT: Change this to your dataset root folder
+# Configuration
+DATASET_PATH = 'dataset2/'
 IMG_HEIGHT = 224
 IMG_WIDTH = 224
 IMG_CHANNELS = 3
 BATCH_SIZE = 32
-EPOCHS = 50          # Initial training epochs
-FINE_TUNE_EPOCHS = 20 # Epochs for fine-tuning
-INIT_LR = 1e-3       # Initial Learning Rate
-FINE_TUNE_LR = 1e-5  # Learning Rate for Fine-tuning
+# adjustable parameters
+EPOCHS = 50          
+FINE_TUNE_EPOCHS = 20
+INIT_LR = 1e-3       
+FINE_TUNE_LR = 1e-5  
 
-# --- 1. Data Loading and Preprocessing ---
-
+# Data Loading and Preprocessing
 def load_and_preprocess_data(dataset_path):
     """Loads images, extracts labels, preprocesses, encodes labels, and splits data."""
+    start_time = time.time()
+    print(f"[INFO] Starting data loading and preprocessing at {time.strftime('%Y-%m-%d %H:%M:%S')}")
     image_paths = []
     species_labels = []
     disease_labels = []
-    combined_labels = [] # For stratification
+    combined_labels = []
 
-    print(f"[INFO] Searching for images in: {dataset_path}")
+    print(f"[INFO] Searching for images in: {os.path.abspath(dataset_path)}") # Show absolute path
     if not os.path.isdir(dataset_path):
-        raise ValueError(f"Dataset path not found or is not a directory: {dataset_path}")
+        raise ValueError(f"Dataset path not found or is not a directory: {os.path.abspath(dataset_path)}")
 
     # Iterate through subdirectories (expected format: species___disease)
+    found_subdirs = 0
+    skipped_subdirs = 0
     for subdir in os.listdir(dataset_path):
         subdir_path = os.path.join(dataset_path, subdir)
         if os.path.isdir(subdir_path):
+            found_subdirs += 1
             # Extract labels from folder name (e.g., "Tomato___Late_Blight")
             try:
-                # Ensure consistent splitting, handle potential extra underscores
                 parts = subdir.split('___')
                 if len(parts) >= 2:
-                    species = parts[0]
-                    disease = '___'.join(parts[1:]) # Join back if disease name had '___'
+                    species = parts[0].replace('_', ' ')
+                    disease = '___'.join(parts[1:]).replace('_', ' ')
                 else:
                     raise ValueError("Incorrect format")
             except ValueError:
                 print(f"[WARNING] Skipping directory '{subdir}': Does not match 'Species___Disease' format.")
+                skipped_subdirs +=1
                 continue
 
-            # Find all images in the subdirectory
-            img_files_found = glob.glob(os.path.join(subdir_path, '*.jpg')) + \
-                              glob.glob(os.path.join(subdir_path, '*.JPG')) + \
-                              glob.glob(os.path.join(subdir_path, '*.jpeg')) + \
-                              glob.glob(os.path.join(subdir_path, '*.JPEG')) + \
-                              glob.glob(os.path.join(subdir_path, '*.png')) + \
-                              glob.glob(os.path.join(subdir_path, '*.PNG'))
+            img_files_found = []
+            for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.gif']:
+                 img_files_found.extend(glob.glob(os.path.join(subdir_path, ext)))
+                 img_files_found.extend(glob.glob(os.path.join(subdir_path, ext.upper())))
 
             if not img_files_found:
                 print(f"[WARNING] No image files found in directory: {subdir_path}")
                 continue
 
+            img_files_found = list(set(img_files_found))
+
             for image_file in img_files_found:
                 image_paths.append(image_file)
                 species_labels.append(species)
                 disease_labels.append(disease)
-                combined_labels.append(subdir) # Use folder name for stratification
+                combined_labels.append(subdir)
 
+    if skipped_subdirs > 0:
+         print(f"[INFO] Processed {found_subdirs} directories, skipped {skipped_subdirs} due to naming format.")
     if not image_paths:
         raise ValueError(f"No valid images found in dataset path: {dataset_path}. Check subdirectories and file extensions.")
 
-    print(f"[INFO] Found {len(image_paths)} images belonging to {len(set(combined_labels))} classes.")
+    print(f"[INFO] Found {len(image_paths)} images belonging to {len(set(combined_labels))} unique 'Species___Disease' combinations.")
 
-    # --- Encode Labels ---
+    # Encode Labels
     species_binarizer = LabelBinarizer()
     disease_binarizer = LabelBinarizer()
 
     # Fit on the full set of labels found
-    y_species_encoded = species_binarizer.fit_transform(species_labels)
+    y_species_intermediate = species_binarizer.fit_transform(species_labels)
     y_disease_encoded = disease_binarizer.fit_transform(disease_labels)
 
     num_species_classes = len(species_binarizer.classes_)
     num_disease_classes = len(disease_binarizer.classes_)
-    print(f"[INFO] Number of species classes: {num_species_classes}")
+    print(f"[INFO] Number of species classes found: {num_species_classes}")
     print(f"[INFO] Species classes: {species_binarizer.classes_}")
-    print(f"[INFO] Number of disease classes: {num_disease_classes}")
+    print(f"[INFO] Number of disease classes found: {num_disease_classes}")
     print(f"[INFO] Disease classes: {disease_binarizer.classes_}")
 
-    # --- Load and Preprocess Images ---
-    # NOTE: Loading all images into memory might be infeasible for very large datasets.
-    # Consider using tf.data.Dataset with a generator function or
-    # image_dataset_from_directory with custom label extraction for large datasets.
+    # Convert labels to one-hot if binary (for CategoricalCrossentropy)
+    # (this logic correctly handles binary and multi-class cases)
+    if num_species_classes == 2:
+        print(f"[INFO] Converting binary species labels (shape {y_species_intermediate.shape}) to one-hot format...")
+        if y_species_intermediate.ndim == 1:
+             y_species_intermediate = y_species_intermediate.reshape(-1, 1)
+        y_species_encoded = tf.keras.utils.to_categorical(y_species_intermediate, num_classes=2)
+        print(f"[INFO] Species labels converted to shape: {y_species_encoded.shape}")
+    elif num_species_classes == 1:
+         raise ValueError("Found only one species class. Need at least two for classification.")
+    else: # More than 2 classes
+        y_species_encoded = y_species_intermediate
+
+    if num_disease_classes == 2:
+        print(f"[INFO] Converting binary disease labels (shape {y_disease_encoded.shape}) to one-hot format...")
+        if y_disease_encoded.ndim == 1:
+            y_disease_encoded = y_disease_encoded.reshape(-1, 1)
+        y_disease_encoded = tf.keras.utils.to_categorical(y_disease_encoded, num_classes=2)
+        print(f"[INFO] Disease labels converted to shape: {y_disease_encoded.shape}")
+    elif num_disease_classes == 1:
+        print(f"[WARNING] Found only one disease class: {disease_binarizer.classes_}. Ensure this is intended.")
+        if y_disease_encoded.ndim == 1:
+             y_disease_encoded = y_disease_encoded.reshape(-1, 1)
+        # If LabelBinarizer outputs empty for single class (unlikely but possible)
+        if y_disease_encoded.shape[1] == 0:
+             print("[ERROR] Disease binarizer resulted in zero columns for single class. Adjusting.")
+             y_disease_encoded = np.ones((len(y_disease_encoded), 1), dtype=int) # Make it (N, 1)
+        # Model output layer will have 1 neuron, might need sigmoid if truly single class prediction
+    else: # More than 2 classes
+        y_disease_encoded = y_disease_encoded
+
+    # Load and Preprocess Images
     print("[INFO] Loading and preprocessing images (this may take time)...")
     X_data = []
     y_species_list = []
     y_disease_list = []
     combined_labels_list = []
-    valid_image_indices = []
+    processed_count = 0
+    error_count = 0
 
+    # Convert encoded labels to numpy for easier indexing in the loop
+    y_species_encoded_np = y_species_encoded.numpy() if hasattr(y_species_encoded, 'numpy') else np.array(y_species_encoded)
+    y_disease_encoded_np = y_disease_encoded.numpy() if hasattr(y_disease_encoded, 'numpy') else np.array(y_disease_encoded)
+
+    total_images = len(image_paths)
     for i, img_path in enumerate(image_paths):
+        if (i + 1) % 500 == 0:
+            print(f"[INFO] Processing image {i+1}/{total_images}...")
         try:
             img = cv2.imread(img_path)
-            if img is None: # Check if image loading failed
-                print(f"[WARNING] Failed to load image {img_path}. Skipping.")
+            if img is None:
+                print(f"[WARNING] Failed to load image (cv2.imread returned None): {img_path}. Skipping.")
+                error_count += 1
                 continue
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # Ensure RGB format
-            img = cv2.resize(img, (IMG_HEIGHT, IMG_WIDTH))
-            # Normalization will be done by ImageDataGenerator or Rescaling layer
+            if img.size == 0:
+                 print(f"[WARNING] Loaded empty image (size 0): {img_path}. Skipping.")
+                 error_count += 1
+                 continue
+
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (IMG_HEIGHT, IMG_WIDTH), interpolation=cv2.INTER_AREA)
             X_data.append(img)
-            # Append corresponding labels only for successfully loaded images
-            y_species_list.append(y_species_encoded[i])
-            y_disease_list.append(y_disease_encoded[i])
+            y_species_list.append(y_species_encoded_np[i])
+            y_disease_list.append(y_disease_encoded_np[i])
             combined_labels_list.append(combined_labels[i])
-            valid_image_indices.append(i) # Keep track of original index if needed elsewhere
+            processed_count += 1
 
         except Exception as e:
             print(f"[WARNING] Error loading or processing image {img_path}: {e}")
+            error_count += 1
 
     # Convert lists of valid data to NumPy arrays
+    if not X_data:
+         raise ValueError("No images could be loaded successfully. Check image files, paths, and permissions.")
+
     X = np.array(X_data, dtype="float32")
-    y_species_encoded = np.array(y_species_list)
-    y_disease_encoded = np.array(y_disease_list)
-    # combined_labels_list now holds the stratification labels for valid images
+    y_species_final = np.array(y_species_list)
+    y_disease_final = np.array(y_disease_list)
 
-    print(f"[INFO] Successfully loaded {len(X)} images.")
-    if len(X) == 0:
-         raise ValueError("No images could be loaded successfully.")
+    print(f"[INFO] Successfully loaded and processed {processed_count} images.")
+    if error_count > 0:
+         print(f"[WARNING] Failed to load/process {error_count} images.")
+    if len(combined_labels_list) != processed_count:
+         raise RuntimeError(f"CRITICAL: Mismatch after processing - Images: {processed_count}, Combined Labels: {len(combined_labels_list)}")
+
     print(f"[INFO] Image data shape: {X.shape}")
-    print(f"[INFO] Species label data shape: {y_species_encoded.shape}")
-    print(f"[INFO] Disease label data shape: {y_disease_encoded.shape}")
+    print(f"[INFO] Species label data shape: {y_species_final.shape}")
+    print(f"[INFO] Disease label data shape: {y_disease_final.shape}")
 
-    # --- Split Data ---
-    # Use combined labels for stratification to keep class distribution similar
+    # Split Data
     print("[INFO] Splitting data into training, validation, and test sets...")
-    # We use the combined_labels_list corresponding to the successfully loaded images (X)
+    # Stratify using the combined 'Species___Disease' label to keep distribution similar
+    if len(combined_labels_list) == 0:
+        print("[WARNING] No combined labels available for stratification. Splitting without stratification.")
+        stratify_labels = None
+    else:
+        stratify_labels = combined_labels_list
+
+    # First split: Create train+val and test sets (e.g., 85% train+val, 15% test)
     X_train_val, X_test, y_species_train_val, y_species_test, y_disease_train_val, y_disease_test, train_val_stratify, _ = train_test_split(
-        X, y_species_encoded, y_disease_encoded, combined_labels_list,
-        test_size=0.15, random_state=42, stratify=combined_labels_list
+        X, y_species_final, y_disease_final, stratify_labels,
+        test_size=0.15, random_state=42, stratify=stratify_labels # Use the combined label list for stratify
     )
+
+    # Second split: Create train and validation sets from train+val
+    # Target: Val size ~15% of original. Test is 15%. So Train+Val is 85%.
+    # We need val_size = 0.15 / 0.85 = ~0.1765 of the train_val set.
+    val_split_ratio = 0.15 / (1.0 - 0.15)
+
+    if len(set(train_val_stratify)) < 2: # Check if stratification is possible for the second split
+         print("[WARNING] Cannot stratify train/validation split (less than 2 classes in train_val_stratify). Splitting without stratification.")
+         stratify_train_val = None
+    else:
+         stratify_train_val = train_val_stratify
 
     X_train, X_val, y_species_train, y_species_val, y_disease_train, y_disease_val = train_test_split(
         X_train_val, y_species_train_val, y_disease_train_val,
-        test_size=0.1765, # 0.15 / (1 - 0.15) to get approx 15% of original for validation
-        random_state=42, stratify=train_val_stratify # Stratify based on the labels in the train_val set
+        test_size=val_split_ratio,
+        random_state=42, stratify=stratify_train_val # Stratify this split too if possible
     )
 
     print(f"[INFO] Training samples: {len(X_train)}")
     print(f"[INFO] Validation samples: {len(X_val)}")
     print(f"[INFO] Test samples: {len(X_test)}")
 
-    # Package labels into dictionaries for multi-output model training
-    y_train = {'species_output': y_species_train, 'disease_output': y_disease_train}
-    y_val = {'species_output': y_species_val, 'disease_output': y_disease_val}
-    y_test = {'species_output': y_species_test, 'disease_output': y_disease_test}
+    y_test_dict = {'species_output': y_species_test, 'disease_output': y_disease_test}
 
+    end_time = time.time()
+    print(f"[INFO] Data loading and preprocessing finished in {end_time - start_time:.2f} seconds.")
 
-    return X_train, y_train, X_val, y_val, X_test, y_test, \
+    # Return individual arrays needed for the custom generator
+    return X_train, y_species_train, y_disease_train, \
+           X_val, y_species_val, y_disease_val, \
+           X_test, y_test_dict, \
            species_binarizer, disease_binarizer, num_species_classes, num_disease_classes
 
-# --- 2. Data Augmentation ---
 
-# Using ImageDataGenerator for augmentation
-# Normalize pixel values within the generator
+# Data Augmentation
 train_datagen = ImageDataGenerator(
-    rescale=1./255,       # Normalize pixel values
-    rotation_range=30,
-    width_shift_range=0.1,
-    height_shift_range=0.1,
-    shear_range=0.2,
-    zoom_range=0.2,
-    horizontal_flip=True,
-    fill_mode='nearest'
+    rescale=1./255,            # Rescale pixel values to [0, 1]
+    rotation_range=30,         # Random rotations
+    width_shift_range=0.1,     # Random horizontal shifts
+    height_shift_range=0.1,    # Random vertical shifts
+    shear_range=0.2,           # Shear transformations
+    zoom_range=0.2,            # Random zoom
+    horizontal_flip=True,      # Random horizontal flips
+    fill_mode='nearest'        # Strategy for filling newly created pixels
 )
-
-# Only rescale validation and test data (no augmentation)
+# IMPORTANT: Validation and Test data should ONLY be rescaled
 val_test_datagen = ImageDataGenerator(rescale=1./255)
 
-# --- 3. Model Building ---
+# sCustom Data Generator
+def multi_output_data_generator(image_datagen, X, y_tuple, batch_size, shuffle=True):
+    """
+    Custom generator to handle multi-output labels with ImageDataGenerator augmentation.
+    Yields batches of (augmented_images, (labels_output_1, labels_output_2, ...)).
+    """
+    num_samples = X.shape[0]
+    indices = np.arange(num_samples)
 
+    while True:
+        if shuffle:
+            np.random.shuffle(indices)
+
+        for start in range(0, num_samples, batch_size):
+            end = min(start + batch_size, num_samples)
+            batch_indices = indices[start:end]
+
+            # Check if batch_indices is empty (can happen if num_samples % batch_size != 0 and it's the last partial batch)
+            if len(batch_indices) == 0:
+                continue
+
+            # Get the original data for the batch
+            X_batch_orig = X[batch_indices]
+
+            # Get the corresponding labels for the batch
+            # Creates a tuple of label batches, e.g., (y_species_batch, y_disease_batch)
+            try:
+                 y_batch_tuple = tuple(y_arr[batch_indices] for y_arr in y_tuple)
+            except IndexError as e:
+                 print(f"[ERROR] IndexError in generator: {e}. Batch indices: {batch_indices}, y_tuple shapes: {[y.shape for y in y_tuple]}")
+                 # Optionally skip this batch or re-raise
+                 continue
+
+            # Apply augmentation using the provided ImageDataGenerator
+            # We use .flow() on the batch itself, asking it *not* to shuffle internally
+            # and providing y=None as we handle labels manually.
+            # It yields a single batch. Applies rescaling & augmentations defined in image_datagen.
+            batch_augment_generator = image_datagen.flow(
+                X_batch_orig,
+                y=None, # Labels are handled manually
+                batch_size=X_batch_orig.shape[0], # Process the whole batch at once
+                shuffle=False # Keep order within the batch consistent with labels
+            )
+            X_batch_augmented = next(batch_augment_generator)
+
+            # Sanity check: ensure augmented batch size matches label batch size
+            if X_batch_augmented.shape[0] != y_batch_tuple[0].shape[0]:
+                print(f"[ERROR] Generator batch size mismatch: X={X_batch_augmented.shape[0]}, y={y_batch_tuple[0].shape[0]} at indices {start}:{end}")
+                continue
+
+            yield X_batch_augmented, y_batch_tuple
+
+
+# Model Building
 def build_multi_output_model(num_species, num_diseases):
-    """Builds the multi-output CNN model using transfer learning."""
-    # Base model (MobileNetV2)
+    """Builds the multi-output CNN model using transfer learning (MobileNetV2)."""
+    print(f"[INFO] Building model for {num_species} species and {num_diseases} disease classes.")
+    if num_diseases == 1:
+         print("[WARNING] Building model with only 1 disease output class. Using softmax activation as configured.")
+         # Consider sigmoid if binary classification is intended and labels are 0/1.
+         # But since we forced one-hot (N, 1), softmax works technically.
+
+    # Load MobileNetV2 pre-trained on ImageNet, without the top classification layer
     base_model = applications.MobileNetV2(
         input_shape=(IMG_HEIGHT, IMG_WIDTH, IMG_CHANNELS),
-        include_top=False,
-        weights='imagenet'
+        include_top=False, # Exclude the final Dense layer of MobileNetV2
+        weights='imagenet' # Use ImageNet pre-trained weights
     )
-    base_model.trainable = False # Freeze base model layers initially
+    # Freeze the layers of the base model initially
+    base_model.trainable = False
+    print(f"[INFO] Base model '{base_model.name}' loaded. Initial trainable status: {base_model.trainable}")
 
-    # Input layer
+    # Define the input layer
     inputs = layers.Input(shape=(IMG_HEIGHT, IMG_WIDTH, IMG_CHANNELS), name='input_layer')
 
-    # Pass input through base model
-    # No need for separate Rescaling layer if using ImageDataGenerator with rescale=1./255
-    # If not using ImageDataGenerator rescale, uncomment the Rescaling layer here.
-    # x = layers.Rescaling(1./255)(inputs)
-    x = base_model(inputs, training=False) # Use inputs directly
+    # Pass inputs through the base model
+    # training=False is important here since we froze the base model layers
+    # It ensures layers like BatchNormalization run in inference mode
+    x = base_model(inputs, training=False)
 
-    # Custom classifier heads
+    # Add custom layers on top of the base model output
+    # Global Average Pooling reduces spatial dimensions to 1x1xC
     x = layers.GlobalAveragePooling2D(name='global_avg_pooling')(x)
-    x = layers.Dropout(0.3, name='top_dropout_1')(x)
-    # x = layers.Dense(256, activation='relu', name='intermediate_dense')(x) # Optional intermediate dense layer
-    # x = layers.Dropout(0.3, name='top_dropout_2')(x)
+    # Dropout for regularization
+    x = layers.Dropout(0.3, name='top_dropout')(x) # Slightly increased dropout
 
-    # Species output head
-    species_out = layers.Dense(num_species, activation='softmax', name='species_output')(x)
+    species_output = layers.Dense(num_species, activation='softmax', name='species_output')(x)
 
-    # Disease output head
-    disease_out = layers.Dense(num_diseases, activation='softmax', name='disease_output')(x)
+    disease_output = layers.Dense(num_diseases, activation='softmax', name='disease_output')(x)
 
-    # Create the model
-    model = models.Model(inputs=inputs, outputs=[species_out, disease_out], name='Plant_Classifier')
+    # Create the final model
+    model = models.Model(inputs=inputs, outputs=[species_output, disease_output], name='Plant_Classifier')
 
     return model
 
-AUTOTUNE = tf.data.AUTOTUNE
-
-def configure_dataset(ds, shuffle=False, augment=False):
-    # Define augmentation layers (example)
-    augmentation_layers = tf.keras.Sequential([
-        layers.RandomFlip("horizontal"),
-        layers.RandomRotation(0.2),
-        layers.RandomZoom(0.2),
-        layers.RandomTranslation(height_factor=0.2, width_factor=0.2, fill_mode="nearest", interpolation="bilinear"),
-    ], name="augmentation_pipeline")
-
-    # Apply rescaling (do it first)
-    ds = ds.map(lambda x, y: (tf.cast(x, tf.float32) / 255.0, y),
-                num_parallel_calls=AUTOTUNE)
-
-    if shuffle:
-        # Use a buffer size related to your dataset size for good shuffling
-        buffer_size = tf.data.experimental.cardinality(ds).numpy() # Get dataset size if possible
-        if buffer_size == tf.data.UNKNOWN_CARDINALITY or buffer_size == tf.data.INFINITE_CARDINALITY:
-             buffer_size = 1000 # Fallback buffer size
-        ds = ds.shuffle(buffer_size=buffer_size, reshuffle_each_iteration=True)
-
-    # Batch the dataset
-    ds = ds.batch(BATCH_SIZE)
-
-    # Apply augmentation after batching (or map before batching if needed)
-    if augment:
-        # Apply augmentation layers using map
-        # Note: Augmentation layers expect batches by default usually
-        ds = ds.map(lambda x, y: (augmentation_layers(x, training=True), y),
-                    num_parallel_calls=AUTOTUNE)
-
-    # Use buffered prefetching
-    return ds.prefetch(buffer_size=AUTOTUNE)
-
-# --- 4. Training ---
-
+# Training
 if __name__ == "__main__":
+    print(f"[INFO] Starting script execution at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[INFO] Using TensorFlow version: {tf.__version__}")
+
     # Load Data
     try:
-        X_train, y_train_dict, X_val, y_val_dict, X_test, y_test_dict, \
+        X_train, y_species_train, y_disease_train, \
+        X_val, y_species_val, y_disease_val, \
+        X_test, y_test_dict, \
         species_binarizer, disease_binarizer, num_species, num_disease = load_and_preprocess_data(DATASET_PATH)
 
-        # Save the binarizers for later use during prediction
+        # Save the binarizers for later use (e.g., in prediction scripts)
         print("[INFO] Saving label binarizers...")
-        with open('species_binarizer.pkl', 'wb') as f:
+        os.makedirs("binarizers", exist_ok=True)
+        with open('binarizers/species_binarizer.pkl', 'wb') as f:
             pickle.dump(species_binarizer, f)
-        with open('disease_binarizer.pkl', 'wb') as f:
+        with open('binarizers/disease_binarizer.pkl', 'wb') as f:
             pickle.dump(disease_binarizer, f)
+        print(f"[INFO] Binarizers saved to 'binarizers/' directory.")
 
-    except (ValueError, FileNotFoundError, IndexError) as e:
+    except (ValueError, FileNotFoundError, IndexError, RuntimeError) as e:
         print(f"[ERROR] Failed to load or process data: {e}")
-        print("[INFO] Please ensure DATASET_PATH is set correctly, contains valid image files,")
-        print("[INFO] and the directory structure is 'Species___Disease'.")
-        exit(1) # Exit if data loading fails
+        print("[INFO] Please ensure:")
+        print(f"  - DATASET_PATH ('{DATASET_PATH}') points to the correct root folder.")
+        print(f"  - The dataset folder contains subdirectories named 'Species___Disease'.")
+        print(f"  - Subdirectories contain valid image files (jpg, png, etc.).")
+        print(f"  - There are at least two different species classes.")
+        print(f"  - Check previous warnings for skipped files or directories.")
+        exit(1)
+    except Exception as e:
+        print(f"[ERROR] An unexpected error occurred during data loading: {e}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
 
-    # --- Create data generators ---
-    # Extract label arrays from the dictionaries
-    y_species_train = y_train_dict['species_output']
-    y_disease_train = y_train_dict['disease_output']
-    y_species_val = y_val_dict['species_output']
-    y_disease_val = y_val_dict['disease_output']
-    y_species_test = y_test_dict['species_output']
-    y_disease_test = y_test_dict['disease_output']
-
-    # IMPORTANT: Create the target labels as a dictionary here,
-    # matching the output layer names. tf.data handles this well.
-    train_ds = tf.data.Dataset.from_tensor_slices(
-        (X_train, {'species_output': y_species_train, 'disease_output': y_disease_train})
-    )
-    val_ds = tf.data.Dataset.from_tensor_slices(
-        (X_val, {'species_output': y_species_val, 'disease_output': y_disease_val})
-    )
-    test_ds = tf.data.Dataset.from_tensor_slices(
-        (X_test, {'species_output': y_species_test, 'disease_output': y_disease_test})
+    # Create data generators using the custom generator function
+    print(f"[INFO] Creating custom train_generator...")
+    train_generator = multi_output_data_generator(
+        train_datagen,      # Use the augmentation generator
+        X_train,
+        (y_species_train, y_disease_train), # Pass labels as a tuple
+        BATCH_SIZE,
+        shuffle=True
     )
 
-    # Remove the old ImageDataGenerators
-    # Use Keras augmentation layers within the dataset pipeline
-    train_ds = configure_dataset(train_ds, shuffle=True, augment=True)
-    val_ds = configure_dataset(val_ds) # No shuffle/augment for validation
-    test_ds = configure_dataset(test_ds)  # No shuffle/augment for test
+    print(f"[INFO] Creating custom val_generator...")
+    val_generator = multi_output_data_generator(
+        val_test_datagen,   # Use the non-augmenting generator (only rescaling)
+        X_val,
+        (y_species_val, y_disease_val), # Pass labels as a tuple
+        BATCH_SIZE,
+        shuffle=False       # No shuffling for validation
+    )
+
+    # Rescale Test Data
+    # It's crucial that test data is preprocessed the same way as validation data (rescaled)
+    print("[INFO] Rescaling test data...")
+    X_test_rescaled = X_test / 255.0 # Apply the same rescaling used in val_test_datagen
 
     # Build Model
     model = build_multi_output_model(num_species, num_disease)
 
     # Compile Model for Initial Training
+    # Define loss functions for each output branch
     losses_dict = {
         'species_output': losses.CategoricalCrossentropy(),
         'disease_output': losses.CategoricalCrossentropy()
     }
+    # Define metrics for each output branch
     metrics_dict = {
         'species_output': metrics.CategoricalAccuracy(name='species_accuracy'),
         'disease_output': metrics.CategoricalAccuracy(name='disease_accuracy')
     }
+    # Define weights for each loss component if one task is more important (optional)
+    # loss_weights_dict = {'species_output': 1.0, 'disease_output': 0.8}
 
     model.compile(
-        optimizer=optimizers.Adam(learning_rate=INIT_LR),
-        loss=losses_dict,      # Model compile still uses the dictionary
-        metrics=metrics_dict   # Model compile still uses the dictionary
+        optimizer=optimizers.Adam(learning_rate=INIT_LR), # Adam optimizer
+        loss=losses_dict,            # Dictionary of losses
+        # loss_weights=loss_weights_dict, # Optional loss weights
+        metrics=metrics_dict         # Dictionary of metrics
     )
-
     print("\n[INFO] Model Summary (Before Fine-tuning):")
-    model.summary()
+    model.summary(line_length=100)
 
-    # Callbacks (Keep as they are)
-    checkpoint_path_init = "plant_model_init_best.keras"
+    # Callbacks for Initial Training
+    os.makedirs("checkpoints", exist_ok=True)
+    checkpoint_path_init = "checkpoints/plant_model_init_best.keras"
     callbacks_init = [
-        ModelCheckpoint(
-            filepath=checkpoint_path_init,
-            save_best_only=True,
-            monitor='val_loss', # Monitor overall validation loss
-            mode='min',         # Save on minimum validation loss
-            verbose=1
-        ),
-        EarlyStopping(
-            monitor='val_loss',
-            patience=10,        # Number of epochs with no improvement after which training will be stopped.
-            mode='min',
-            restore_best_weights=True, # Restores model weights from the epoch with the best value of the monitored quantity.
-            verbose=1
-        ),
-        ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.2,         # Factor by which the learning rate will be reduced. new_lr = lr * factor
-            patience=5,         # Number of epochs with no improvement after which learning rate will be reduced.
-            mode='min',
-            verbose=1,
-            min_lr=1e-6         # Lower bound on the learning rate.
-        )
+        # Save the best model based on validation loss
+        ModelCheckpoint(filepath=checkpoint_path_init, save_best_only=True,
+                        monitor='val_loss', mode='min', save_weights_only=False, verbose=1),
+        # Stop training early if validation loss doesn't improve for 'patience' epochs
+        EarlyStopping(monitor='val_loss', patience=10, mode='min', # Increased patience slightly
+                      restore_best_weights=True, verbose=1), # Restore weights from the epoch with the best val_loss
+        # Reduce learning rate when validation loss plateaus
+        ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, # Reduce LR if no improvement for 5 epochs
+                          mode='min', verbose=1, min_lr=1e-6) # Minimum learning rate
     ]
 
-    # Initial Training (Train only the classifier heads)
-    print("\n[INFO] Starting Initial Training...")
-    # NO need for steps_per_epoch when using tf.data datasets
+    # Initial Training
+    print(f"\n[INFO] Starting Initial Training (Frozen Base Model) for {EPOCHS} epochs...")
+    # Calculate steps per epoch, ensuring it's at least 1
+    steps_per_epoch = max(1, len(X_train) // BATCH_SIZE)
+    validation_steps = max(1, len(X_val) // BATCH_SIZE)
+
+    start_time_init = time.time()
     history_init = model.fit(
-        train_ds, # Pass the dataset directly
+        train_generator,          # Custom training generator
+        steps_per_epoch=steps_per_epoch,
         epochs=EPOCHS,
-        validation_data=val_ds, # Pass the dataset directly
-        callbacks=callbacks_init,
-        verbose=1
+        validation_data=val_generator, # Custom validation generator
+        validation_steps=validation_steps,
+        callbacks=callbacks_init,   # Callbacks for saving, early stopping, LR reduction
+        verbose=1                   # Show progress bar
     )
+    end_time_init = time.time()
+    print(f"[INFO] Initial training finished in {end_time_init - start_time_init:.2f} seconds.")
 
-    # --- 5. Fine-Tuning ---
-    print("\n[INFO] Starting Fine-Tuning (Unfreezing Top Base Model Layers)...")
+    # Fine-Tuning
+    print("\n[INFO] Starting Fine-Tuning Phase (Unfreezing Top Base Model Layers)...")
 
-    # Load the best weights from initial training phase
-    print(f"[INFO] Loading best weights from initial training: {checkpoint_path_init}")
-    # Ensure the file exists before loading
+    # Load the best model saved during the initial training phase
+    print(f"[INFO] Loading best model from initial training: {checkpoint_path_init}")
     if os.path.exists(checkpoint_path_init):
-         model.load_weights(checkpoint_path_init)
+        # Load the entire model structure and weights
+        # Need to re-compile after loading if changing trainability or optimizer
+        model = tf.keras.models.load_model(checkpoint_path_init)
+        print("[INFO] Successfully loaded best model from initial phase.")
     else:
-        print(f"[WARNING] Checkpoint file {checkpoint_path_init} not found. Proceeding with current weights.")
+        print(f"[WARNING] Checkpoint file '{checkpoint_path_init}' not found.")
+        print("[INFO] Proceeding with model weights from the end of initial training (potentially suboptimal).")
+        # If EarlyStopping restored weights, the 'model' variable holds them.
 
-
-    # Find the base model layer (adjust index if model structure changes)
+    # Find the base model layer to unfreeze
     base_model_layer = None
     for layer in model.layers:
-        if layer.name == 'mobilenetv2_1.00_224': # Default name for MobileNetV2
+        # Check name or type - MobileNetV2 usually has 'mobilenetv2' in its name
+        if isinstance(layer, tf.keras.Model) and "mobilenetv2" in layer.name.lower():
              base_model_layer = layer
              break
 
-    if base_model_layer is None:
-        print("[ERROR] Could not find base model layer by name. Cannot proceed with fine-tuning.")
-        exit(1)
+    history_fine = None # Initialize fine-tuning history
 
-    base_model_layer.trainable = True # Unfreeze the entire base model for fine-tuning
+    if base_model_layer:
+        print(f"[INFO] Found base model layer: '{base_model_layer.name}'.")
 
-    # Decide how many layers to KEEP FROZEN (fine-tune layers AFTER this index)
-    # This number depends heavily on the base model architecture (MobileNetV2 has ~154 layers)
-    # Fine-tuning more layers requires lower learning rate and potentially more data
-    fine_tune_from_layer = 100 # Example: Freeze first 100 layers, fine-tune the rest
-    print(f"[INFO] Freezing the first {fine_tune_from_layer} layers of the base model.")
+        # Unfreeze the base model
+        base_model_layer.trainable = True
+        print(f"[INFO] Base model '{base_model_layer.name}' unfrozen.")
 
-    for layer in base_model_layer.layers[:fine_tune_from_layer]:
-         layer.trainable = False
+        # Fine-tune only the top layers of the base model for stability
+        # Example: Freeze the first 100 layers and fine-tune the rest
+        fine_tune_at = 100
+        print(f"[INFO] Freezing layers before layer {fine_tune_at} in '{base_model_layer.name}'.")
 
+        if hasattr(base_model_layer, 'layers'): # Ensure it has sub-layers accessible
+            for i, layer in enumerate(base_model_layer.layers[:fine_tune_at]):
+                layer.trainable = False
+            print(f"[INFO] First {fine_tune_at} layers frozen. Remaining layers are trainable.")
+        else:
+            print(f"[WARNING] Base model layer '{base_model_layer.name}' does not seem to have sub-layers accessible via '.layers'. Fine-tuning will affect the entire base model.")
 
-    # Re-compile the model with a lower learning rate for fine-tuning
-    model.compile(
-        optimizer=optimizers.Adam(learning_rate=FINE_TUNE_LR), # Very low LR
-        loss=losses_dict,
-        metrics=metrics_dict
-    )
-
-    print("\n[INFO] Model Summary (During Fine-tuning):")
-    model.summary() # Verify trainable parameters changed
-
-    # Define new checkpoint path for fine-tuning
-    checkpoint_path_fine = "plant_model_fine_tuned_best.keras"
-    # Create new callbacks or adjust existing ones for fine-tuning phase
-    callbacks_fine = [
-         ModelCheckpoint(
-            filepath=checkpoint_path_fine,
-            save_best_only=True,
-            monitor='val_loss', # Monitor overall validation loss
-            mode='min',
-            verbose=1
-        ),
-        EarlyStopping( # You might want slightly different patience here
-            monitor='val_loss',
-            patience=15, # Allow more patience during fine-tuning
-            mode='min',
-            restore_best_weights=True,
-            verbose=1
-        ),
-        ReduceLROnPlateau( # Reset patience or adjust
-            monitor='val_loss',
-            factor=0.2,
-            patience=7,
-            mode='min',
-            verbose=1,
-            min_lr=1e-7 # Can go even lower if needed
+        # Re-compile the model with a much lower learning rate for fine-tuning
+        print(f"[INFO] Re-compiling model for fine-tuning with LR={FINE_TUNE_LR}.")
+        model.compile(
+            optimizer=optimizers.Adam(learning_rate=FINE_TUNE_LR), # Crucial: Lower LR
+            loss=losses_dict,
+            # loss_weights=loss_weights_dict, # Optional
+            metrics=metrics_dict
         )
-    ]
+        print("\n[INFO] Model Summary (During Fine-tuning):")
+        model.summary(line_length=100) # Note the change in trainable parameters
 
-    # Continue training (fine-tuning)
-    total_epochs = EPOCHS + FINE_TUNE_EPOCHS
-    # Use the number of epochs already completed in history_init
-    initial_epoch_fine_tune = len(history_init.epoch) if history_init and history_init.epoch else 0
+        # Callbacks for fine-tuning
+        checkpoint_path_fine = "checkpoints/plant_model_fine_tuned_best.keras"
+        callbacks_fine = [
+            ModelCheckpoint(filepath=checkpoint_path_fine, save_best_only=True,
+                            monitor='val_loss', mode='min', save_weights_only=False, verbose=1),
+            # Longer patience might be needed for fine-tuning convergence
+            EarlyStopping(monitor='val_loss', patience=15, mode='min',
+                          restore_best_weights=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=7, # Slightly longer patience for LR reduction
+                              mode='min', verbose=1, min_lr=1e-7) # Allow LR to go even lower
+        ]
 
-    print(f"\n[INFO] Continuing training for fine-tuning up to {total_epochs} total epochs...")
-    history_fine = model.fit(
-        train_ds, # Pass the dataset directly
-        epochs=total_epochs,
-        initial_epoch=initial_epoch_fine_tune,
-        validation_data=val_ds, # Pass the dataset directly
-        callbacks=callbacks_fine,
-        verbose=1
-    )
+        # Determine starting epoch for fine-tuning history continuity
+        # Use length of previous history if available and valid
+        initial_epoch_fine_tune = 0
+        if history_init and history_init.epoch:
+             initial_epoch_fine_tune = history_init.epoch[-1] + 1
+             print(f"[INFO] Resuming training from epoch {initial_epoch_fine_tune}.")
+        else:
+             # Fallback if initial training history is missing or empty
+             initial_epoch_fine_tune = EPOCHS
+             print(f"[WARNING] Initial training history not available. Starting fine-tuning epoch count from {initial_epoch_fine_tune}.")
 
 
-    # --- 6. Evaluation ---
+        total_epochs_target = initial_epoch_fine_tune + FINE_TUNE_EPOCHS
+        print(f"\n[INFO] Starting Fine-Tuning Training from epoch {initial_epoch_fine_tune} up to {total_epochs_target} total epochs...")
+
+        start_time_fine = time.time()
+        history_fine = model.fit(
+            train_generator,          # Custom training generator
+            steps_per_epoch=steps_per_epoch,
+            epochs=total_epochs_target, # Total epochs across both phases
+            initial_epoch=initial_epoch_fine_tune, # Start from where initial training left off
+            validation_data=val_generator, # Custom validation generator
+            validation_steps=validation_steps,
+            callbacks=callbacks_fine,   # Callbacks specific to fine-tuning
+            verbose=1
+        )
+        end_time_fine = time.time()
+        print(f"[INFO] Fine-tuning finished in {end_time_fine - start_time_fine:.2f} seconds.")
+
+    else:
+        print("[ERROR] Could not find base model layer ('mobilenetv2'). Skipping fine-tuning phase.")
+        checkpoint_path_fine = checkpoint_path_init # The best model is the one from init phase
+
+    # Evaluation
     print("\n[INFO] Evaluating final model on the test set...")
 
-    # Load the absolute best weights saved during fine-tuning
-    best_model_path = checkpoint_path_fine
-    if not os.path.exists(best_model_path):
-        print(f"[WARNING] Fine-tuning checkpoint {best_model_path} not found. Using initial training best weights {checkpoint_path_init} for evaluation.")
-        best_model_path = checkpoint_path_init # Fallback to initial best if fine-tuning one isn't saved
-        if not os.path.exists(best_model_path):
-            print(f"[ERROR] No best model checkpoint found ({checkpoint_path_init} or {checkpoint_path_fine}). Cannot evaluate.")
-            exit(1)
+    # Determine the best model checkpoint to load for final evaluation
+    best_model_path = checkpoint_path_fine # Default to fine-tuned checkpoint
+    if not os.path.exists(best_model_path) or history_fine is None: # If fine-tuning didn't run/save
+         print(f"[INFO] Fine-tuning checkpoint '{best_model_path}' not found or fine-tuning skipped.")
+         best_model_path = checkpoint_path_init # Fall back to initial training checkpoint
+         if not os.path.exists(best_model_path):
+             print(f"[ERROR] No best model checkpoint found ('{checkpoint_path_init}' or '{checkpoint_path_fine}').")
+             print("[INFO] Evaluating model from the end of the last training phase (may be suboptimal).")
+             # Keep the 'model' object as is (it holds weights from the end of the last training run)
+         else:
+             print(f"[INFO] Loading best model from initial training phase: '{best_model_path}'")
+             model = tf.keras.models.load_model(best_model_path) # Load the best init model
+    else:
+        # If fine-tuning ran and saved a checkpoint, load that one
+        print(f"[INFO] Loading best model from fine-tuning phase: '{best_model_path}'")
+        model = tf.keras.models.load_model(best_model_path) # Load the best fine-tuned model
 
-    print(f"[INFO] Loading best weights from: {best_model_path}")
-    model.load_weights(best_model_path)
+    # Perform Evaluation
+    print("[INFO] Evaluating model performance on the rescaled test dataset...")
+    # Ensure test data is rescaled (X_test_rescaled was prepared earlier)
+    # Use the y_test_dict which has the correct dictionary format {'output_name': labels}
+    test_results = model.evaluate(
+        X_test_rescaled,
+        y_test_dict,
+        batch_size=BATCH_SIZE,
+        verbose=0,            # Set to 1 for progress bar during evaluation
+        return_dict=True      # Returns results as a dictionary
+        )
 
-    print(f"[INFO] Loading best weights from: {best_model_path}")
-    model.load_weights(best_model_path)
+    print("\n--- Test Set Evaluation Results ---")
+    print(f"  Overall Test Loss: {test_results['loss']:.4f}")
+    if 'species_accuracy' in test_results:
+         print(f"  Species Test Accuracy: {test_results['species_accuracy']*100:.2f}%")
+    if 'disease_accuracy' in test_results:
+         print(f"  Disease Test Accuracy: {test_results['disease_accuracy']*100:.2f}%")
+    # Print other metrics if needed (e.g., individual output losses)
+    # for name, value in test_results.items():
+    #      if name not in ['loss', 'species_accuracy', 'disease_accuracy']:
+    #           print(f"  {name}: {value:.4f}")
 
-    # Evaluate using the test dataset
-    test_results = model.evaluate(test_ds) # Pass the dataset directly
+    # Classification Reports
+    print("\n[INFO] Generating Classification Reports for Test Set...")
+    print("[INFO] Making predictions on the test set...")
+    predictions = model.predict(X_test_rescaled, batch_size=BATCH_SIZE, verbose=1)
 
-    # Print results (need to adjust index lookup slightly)
-    # Keras might flatten the results list, check model.metrics_names order
-    metrics_map = {name: i for i, name in enumerate(model.metrics_names)}
-    print(f"\n[RESULTS] Test Loss (Overall): {test_results[metrics_map['loss']]:.4f}")
-    print(f"[RESULTS] Test Loss (Species): {test_results[metrics_map['species_output_loss']]:.4f}")
-    print(f"[RESULTS] Test Loss (Disease): {test_results[metrics_map['disease_output_loss']]:.4f}")
-    print(f"[RESULTS] Test Accuracy (Species): {test_results[metrics_map['species_accuracy']]*100:.2f}%")
-    print(f"[RESULTS] Test Accuracy (Disease): {test_results[metrics_map['disease_accuracy']]*100:.2f}%")
+    # Extract true labels (already one-hot) from the y_test dictionary
+    y_true_species = y_test_dict['species_output']
+    y_true_disease = y_test_dict['disease_output']
 
+    # Predictions is a list [pred_species, pred_disease] based on model output order
+    y_pred_species_scores = predictions[0]
+    y_pred_disease_scores = predictions[1]
 
-    print("\n[INFO] Generating Classification Reports...")
-    # Predict on the test dataset
-    # Note: model.predict on a tf.data.Dataset iterates through it.
-    predictions = model.predict(test_ds)
+    # Convert true labels and predictions from one-hot/scores to class indices (integers)
+    y_true_species_indices = np.argmax(y_true_species, axis=1)
+    y_pred_species_indices = np.argmax(y_pred_species_scores, axis=1)
 
-    # True labels need to be extracted from the test_ds (or use original arrays)
-    y_true_species_indices = np.argmax(y_species_test, axis=1)
-    y_true_disease_indices = np.argmax(y_disease_test, axis=1)
+    y_true_disease_indices = np.argmax(y_true_disease, axis=1)
+    y_pred_disease_indices = np.argmax(y_pred_disease_scores, axis=1)
 
-    # Predictions are returned in a list matching model output order
-    y_pred_species_indices = np.argmax(predictions[0], axis=1)
-    y_pred_disease_indices = np.argmax(predictions[1], axis=1)
+    # Get class names from the saved binarizers
+    species_target_names = species_binarizer.classes_
+    disease_target_names = disease_binarizer.classes_
 
-    # Ensure predicted length matches true length (in case of partial last batch)
-    num_test_samples = len(X_test)
-    y_pred_species_indices = y_pred_species_indices[:num_test_samples]
-    y_pred_disease_indices = y_pred_disease_indices[:num_test_samples]
+    print(f"[DEBUG] Number of species target names: {len(species_target_names)}")
+    print(f"[DEBUG] Number of disease target names: {len(disease_target_names)}")
+    print(f"[DEBUG] Unique predicted species indices: {np.unique(y_pred_species_indices)}")
+    print(f"[DEBUG] Unique predicted disease indices: {np.unique(y_pred_disease_indices)}")
 
 
     print("\n--- Species Classification Report ---")
     try:
+        # Define the labels actually present or expected
+        report_labels_species = np.arange(len(species_target_names))
         print(classification_report(
             y_true_species_indices,
             y_pred_species_indices,
-            target_names=species_binarizer.classes_,
-            zero_division=0 # Handle cases with no predicted/true samples for a class
+            labels=report_labels_species, # Ensure report covers all known classes
+            target_names=species_target_names,
+            zero_division=0 # Avoid warnings for classes with no support in predictions
         ))
     except ValueError as e:
         print(f"[WARNING] Could not generate species classification report: {e}")
+        print("Possible issues: Mismatch between labels found and binarizer classes, or issues with prediction shapes.")
+        print(f"Shape y_true_species_indices: {y_true_species_indices.shape}")
+        print(f"Shape y_pred_species_indices: {y_pred_species_indices.shape}")
+        print(f"Unique true species labels: {np.unique(y_true_species_indices)}")
+        print(f"Unique predicted species labels: {np.unique(y_pred_species_indices)}")
 
 
     print("\n--- Disease Classification Report ---")
     try:
+        report_labels_disease = np.arange(len(disease_target_names))
         print(classification_report(
             y_true_disease_indices,
             y_pred_disease_indices,
-            target_names=disease_binarizer.classes_,
+            labels=report_labels_disease, # Ensure report covers all known classes
+            target_names=disease_target_names,
             zero_division=0
         ))
     except ValueError as e:
         print(f"[WARNING] Could not generate disease classification report: {e}")
-    
+        print("Possible issues: Mismatch between labels found and binarizer classes, or issues with prediction shapes.")
+        print(f"Shape y_true_disease_indices: {y_true_disease_indices.shape}")
+        print(f"Shape y_pred_disease_indices: {y_pred_disease_indices.shape}")
+        print(f"Unique true disease labels: {np.unique(y_true_disease_indices)}")
+        print(f"Unique predicted disease labels: {np.unique(y_pred_disease_indices)}")
 
-    # --- 7. Saving Final Model ---
+    # Saving Final Model
+    # The 'model' variable should hold the best loaded weights at this point
     final_model_path = "plant_species_disease_model_final.keras"
     print(f"\n[INFO] Saving final trained model (loaded with best weights) to: {final_model_path}")
-    model.save(final_model_path)
-
-    print("\n[INFO] Script finished successfully.")
+    try:
+        model.save(final_model_path)
+        print(f"[INFO] Final model successfully saved to {final_model_path}")
+    except Exception as e:
+        print(f"[ERROR] Failed to save final model: {e}")
