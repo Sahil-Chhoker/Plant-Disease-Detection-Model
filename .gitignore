@@ -3,5 +3,4 @@ env
 .python-version
 fulldata.zip
 dataset
-dataset2
 plant_disease_dataset_parent
