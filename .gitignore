@@ -4,3 +4,5 @@ env
 fulldata.zip
 dataset
 plant_disease_dataset_parent
+.vscode
+archive_full
